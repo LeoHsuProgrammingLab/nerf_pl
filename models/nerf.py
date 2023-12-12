@@ -92,7 +92,7 @@ class NeRF(nn.Module):
                         x is of shape (B, self.in_channels_xyz)
 
         Outputs:
-            if sigma_ony:
+            if sigma_only:
                 sigma: (B, 1) sigma
             else:
                 out: (B, 4), rgb and sigma

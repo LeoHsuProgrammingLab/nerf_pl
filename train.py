@@ -22,13 +22,12 @@ from metrics import *
 # pytorch-lightning
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.logging import TestTubeLogger
+from pytorch_lightning import loggers
 
 class NeRFSystem(LightningModule):
     def __init__(self, hparams):
         super(NeRFSystem, self).__init__()
-        self.hparams = hparams
-
+        self.save_hyperparameters(hparams)
         self.loss = loss_dict[hparams.loss_type]()
 
         self.embedding_xyz = Embedding(3, 10) # 10 is the default number
@@ -37,6 +36,10 @@ class NeRFSystem(LightningModule):
 
         self.nerf_coarse = NeRF()
         self.models = [self.nerf_coarse]
+        self.validation_step_outputs = {
+            'val_loss': [],
+            'val_psnr': []
+        }
         if hparams.N_importance > 0:
             self.nerf_fine = NeRF()
             self.models += [self.nerf_fine]
@@ -72,8 +75,7 @@ class NeRFSystem(LightningModule):
 
     def prepare_data(self):
         dataset = dataset_dict[self.hparams.dataset_name]
-        kwargs = {'root_dir': self.hparams.root_dir,
-                  'img_wh': tuple(self.hparams.img_wh)}
+        kwargs = {'root_dir': self.hparams.root_dir}
         if self.hparams.dataset_name == 'llff':
             kwargs['spheric_poses'] = self.hparams.spheric_poses
             kwargs['val_num'] = self.hparams.num_gpus
@@ -121,7 +123,8 @@ class NeRFSystem(LightningModule):
         rays = rays.squeeze() # (H*W, 3)
         rgbs = rgbs.squeeze() # (H*W, 3)
         results = self(rays)
-        log = {'val_loss': self.loss(results, rgbs)}
+        loss = self.loss(results, rgbs)
+        self.log("val_loss", loss, prog_bar=True)
         typ = 'fine' if 'rgb_fine' in results else 'coarse'
     
         if batch_nb == 0:
@@ -134,47 +137,52 @@ class NeRFSystem(LightningModule):
             self.logger.experiment.add_images('val/GT_pred_depth',
                                                stack, self.global_step)
 
-        log['val_psnr'] = psnr(results[f'rgb_{typ}'], rgbs)
-        return log
+        psnr_ = psnr(results[f'rgb_{typ}'], rgbs)
+        self.log("val_psnr", psnr_, prog_bar=True)
 
-    def validation_epoch_end(self, outputs):
-        mean_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        mean_psnr = torch.stack([x['val_psnr'] for x in outputs]).mean()
+        self.validation_step_outputs['val_loss'].append(loss)
+        self.validation_step_outputs['val_psnr'].append(psnr_)
+        return {
+            'val_loss': loss,
+            'val_psnr': psnr_
+        }
 
-        return {'progress_bar': {'val_loss': mean_loss,
-                                 'val_psnr': mean_psnr},
-                'log': {'val/loss': mean_loss,
-                        'val/psnr': mean_psnr}
-               }
+    def on_validation_epoch_end(self):
+        mean_loss = torch.stack(self.validation_step_outputs['val_loss']).mean()
+        mean_psnr = torch.stack(self.validation_step_outputs['val_psnr']).mean()
+
+        return {
+            'val_loss': mean_loss,
+            'val_psnr': mean_psnr
+        },
 
 
 if __name__ == '__main__':
     hparams = get_opts()
     system = NeRFSystem(hparams)
-    checkpoint_callback = ModelCheckpoint(filepath=os.path.join(f'ckpts/{hparams.exp_name}',
-                                                                '{epoch:d}'),
-                                          monitor='val/loss',
-                                          mode='min',
-                                          save_top_k=5,)
+    print(hparams.exp_name)
+    checkpoint_callback = \
+        ModelCheckpoint(
+            dirpath='./ckpts',
+            filename=hparams.exp_name+'-{epoch:02d}-{val_psnr:.2f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=3,
+        )
 
-    logger = TestTubeLogger(
+    logger = loggers.TensorBoardLogger(
         save_dir="logs",
         name=hparams.exp_name,
-        debug=False,
-        create_git_tag=False
+        # debug=False,
+        # create_git_tag=False
     )
 
-    trainer = Trainer(max_epochs=hparams.num_epochs,
-                      checkpoint_callback=checkpoint_callback,
-                      resume_from_checkpoint=hparams.ckpt_path,
-                      logger=logger,
-                      early_stop_callback=None,
-                      weights_summary=None,
-                      progress_bar_refresh_rate=1,
-                      gpus=hparams.num_gpus,
-                      distributed_backend='ddp' if hparams.num_gpus>1 else None,
-                      num_sanity_val_steps=1,
-                      benchmark=True,
-                      profiler=hparams.num_gpus==1)
+    trainer = Trainer(
+        max_epochs=hparams.num_epochs,# V
+        callbacks=[checkpoint_callback],
+        logger=logger, # V
+        num_sanity_val_steps=1,
+        benchmark=True, # V
+    )
 
     trainer.fit(system)
